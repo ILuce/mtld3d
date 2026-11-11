@@ -663,6 +663,44 @@ const fn context_register(context: *mut c_void, offset: usize) -> Option<usize> 
     Some(usize::from_ne_bytes(unsafe { register.read() }))
 }
 
+/// The bounds of the region of the address space that holds `addr`, when the system
+/// describes it as memory a read does not fault on.
+///
+/// Fork patch 1: `import_patch` reads the process's main module only where this says
+/// it can, because a packed executable's headers and tables do not have to describe what
+/// is mapped.
+pub fn readable_region(addr: usize) -> Option<(usize, usize)> {
+    let mut info = MemoryBasicInformation {
+        base_address: core::ptr::null_mut(),
+        allocation_base: core::ptr::null_mut(),
+        allocation_protect: 0,
+        region_size: 0,
+        state: 0,
+        protect: 0,
+        kind: 0,
+    };
+    // SAFETY: kernel32 export filling a struct of the size passed; `addr` is
+    // only used as a query key.
+    let got = unsafe {
+        VirtualQuery(
+            addr as *const c_void,
+            &raw mut info,
+            size_of::<MemoryBasicInformation>(),
+        )
+    };
+    let base = info.base_address as usize;
+    let region = mtld3d_core::crash_report::QueriedRegion::new(
+        base,
+        info.region_size,
+        info.state,
+        info.protect,
+    );
+    if got == 0 || !mtld3d_core::crash_report::readable_span(&region, addr, 1) {
+        return None;
+    }
+    Some((base, base.checked_add(info.region_size)?))
+}
+
 /// The word at `addr` on the faulting thread's stack, or `None` when it cannot be read.
 ///
 /// The stack pointer of a faulting thread may be anything, so the region

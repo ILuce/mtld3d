@@ -59,6 +59,7 @@ pub mod guest_queries;
 pub mod held_pages;
 pub mod hud_stats;
 pub mod ids;
+pub mod import_table;
 pub mod level_authority;
 pub mod multisample;
 pub mod page_box;
