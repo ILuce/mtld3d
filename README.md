@@ -1,3 +1,10 @@
+> **This is an altered version of mtld3d: a fork maintained by ILuce.** It is upstream
+> mtld3d 0.15.3 (<https://github.com/athei/mtld3d>, tag `v0.15.3`) with this fork's own
+> patches on top, listed in [FORK.md](FORK.md). It is not the original software, and the
+> original author neither publishes nor supports it. Its versions carry the suffix
+> `+iluce.N`, which the libraries write into their log. The licence is unchanged
+> ([LICENSE](LICENSE), zlib).
+
 # mtld3d
 
 Direct3D 9 for Wine on macOS, backed by Metal.
