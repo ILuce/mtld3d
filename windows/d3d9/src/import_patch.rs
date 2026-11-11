@@ -9,34 +9,19 @@
 //! covered: nothing it calls goes through an import slot.
 
 use core::{
+    cell::Cell,
     ffi::c_void,
     ptr,
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
 use log::warn;
+use mtld3d_core::import_table::{self, ImageBytes};
 
 use super::LOG_TARGET;
 
 /// `VirtualProtect` protection that lets an import slot be written.
 const PAGE_READWRITE: u32 = 0x04;
-/// `IMAGE_DOS_HEADER.e_lfanew`: file offset of the NT headers.
-const E_LFANEW_OFFSET: usize = 0x3c;
-/// Size of `IMAGE_FILE_HEADER`, which sits between the PE signature and the optional header.
-const FILE_HEADER_SIZE: usize = 20;
-/// `IMAGE_OPTIONAL_HEADER.Magic` for PE32 and PE32+.
-const PE32_MAGIC: u16 = 0x10b;
-const PE32PLUS_MAGIC: u16 = 0x20b;
-/// Offset of `DataDirectory` inside the optional header, per format.
-const PE32_DATA_DIRECTORY_OFFSET: usize = 96;
-const PE32PLUS_DATA_DIRECTORY_OFFSET: usize = 112;
-/// `IMAGE_DIRECTORY_ENTRY_IMPORT`.
-const IMPORT_DIRECTORY: usize = 1;
-/// Size of `IMAGE_IMPORT_DESCRIPTOR`.
-const IMPORT_DESCRIPTOR_SIZE: usize = 20;
-/// Thunk entries with this bit import by ordinal and carry no name.
-const ORDINAL_FLAG: usize = 1 << (usize::BITS - 1);
-
 unsafe extern "system" {
     fn GetModuleHandleA(module_name: *const u8) -> *mut c_void;
     fn VirtualProtect(
@@ -59,11 +44,15 @@ pub struct Hook<'a> {
 
 /// A PE image mapped by the loader, addressed by its base.
 ///
-/// The invariant the constructor asserts is that `base` is the base of an
-/// image the loader mapped in this process, so every RVA in its headers
-/// resolves inside the mapping; the methods read headers on that basis.
+/// The invariant the constructor asserts is that `base` is the base of an image the loader
+/// mapped in this process. Nothing more is taken from it on trust: the image is read through
+/// [`ImageBytes`], whose `read` asks the system whether the bytes are there (fork patch
+/// 1: a packed main module's headers and tables do not have to describe what is mapped).
 pub struct MappedImage {
     base: *const u8,
+    /// The address range the system last reported as committed and readable, so the reads
+    /// of one table ask once.
+    readable: Cell<(usize, usize)>,
 }
 
 /// A fixed set of the main module's import slots, redirected to entry points of ours.
@@ -91,103 +80,70 @@ impl MappedImage {
     /// `base` must be the base address of a PE image the loader mapped in
     /// this process (an `HMODULE`).
     const unsafe fn new(base: *const u8) -> Self {
-        Self { base }
+        Self {
+            base,
+            readable: Cell::new((0, 0)),
+        }
     }
 
     /// The import-address-table slot for `func`, if the image imports it.
     ///
     /// `dll` names the exporting module the import must come from; `None`
     /// takes the first import descriptor that carries the name, whichever
-    /// module it is.
+    /// module it is. The walk is [`import_table::import_slot_rva`]: it reads
+    /// nothing outside the image and nothing the system does not report as
+    /// readable, so an image whose import tables are not usable (a packed
+    /// executable) has no slot here and costs no fault.
     pub fn import_slot(&self, dll: Option<&[u8]>, func: &[u8]) -> Option<*mut *const ()> {
-        if self.read::<[u8; 2]>(0) != *b"MZ" {
-            return None;
+        let slot = import_table::import_slot_rva(self, size_of::<usize>(), dll, func)?;
+        // An import-address-table entry is pointer-aligned by the PE layout;
+        // the walk held it inside the image and read it, and the address
+        // keeps the image's provenance.
+        let address = self.base.expose_provenance().checked_add(slot)?;
+        Some(ptr::with_exposed_provenance_mut(address))
+    }
+
+    /// Whether every byte of `start..end` is committed memory that a read does not fault on.
+    fn is_readable(&self, start: usize, end: usize) -> bool {
+        let (known_start, known_end) = self.readable.get();
+        if known_start <= start && end <= known_end {
+            return true;
         }
-        let nt = usize::try_from(self.read::<u32>(E_LFANEW_OFFSET)).ok()?;
-        if self.read::<[u8; 4]>(nt) != *b"PE\0\0" {
-            return None;
+        let mut at = start;
+        while at < end {
+            let Some((region_start, region_end)) = super::crash::readable_region(at) else {
+                return false;
+            };
+            if region_end <= at {
+                return false;
+            }
+            self.readable.set((region_start, region_end));
+            at = region_end;
         }
-        let optional = nt + 4 + FILE_HEADER_SIZE;
-        let directory = match self.read::<u16>(optional) {
-            PE32_MAGIC => PE32_DATA_DIRECTORY_OFFSET,
-            PE32PLUS_MAGIC => PE32PLUS_DATA_DIRECTORY_OFFSET,
-            _ => return None,
+        true
+    }
+}
+
+impl ImageBytes for MappedImage {
+    fn read(&self, rva: usize, out: &mut [u8]) -> bool {
+        let Some(start) = self.base.addr().checked_add(rva) else {
+            return false;
         };
-        let imports =
-            usize::try_from(self.read::<u32>(optional + directory + IMPORT_DIRECTORY * 8)).ok()?;
-        if imports == 0 {
-            return None;
+        let Some(end) = start.checked_add(out.len()) else {
+            return false;
+        };
+        if !self.is_readable(start, end) {
+            return false;
         }
-        for i in 0.. {
-            let descriptor = imports + i * IMPORT_DESCRIPTOR_SIZE;
-            let name_rva = usize::try_from(self.read::<u32>(descriptor + 12)).ok()?;
-            if name_rva == 0 {
-                return None;
-            }
-            if dll.is_some_and(|dll| !self.c_string(name_rva).eq_ignore_ascii_case(dll)) {
-                continue;
-            }
-            let names = usize::try_from(self.read::<u32>(descriptor)).ok()?;
-            let addresses = usize::try_from(self.read::<u32>(descriptor + 16)).ok()?;
-            // Without a separate name table the address table still holds
-            // the names before the loader overwrote it; the loader has, so
-            // an image bound that way is not searchable here.
-            if names == 0 || addresses == 0 {
-                continue;
-            }
-            if let Some(slot) = self.named_slot(names, addresses, func) {
-                return Some(slot);
-            }
-        }
-        None
-    }
-
-    /// The address-table slot of `func` in one descriptor's name table.
-    fn named_slot(&self, names: usize, addresses: usize, func: &[u8]) -> Option<*mut *const ()> {
-        for j in 0.. {
-            let entry = self.read::<usize>(names + j * size_of::<usize>());
-            if entry == 0 {
-                return None;
-            }
-            if entry & ORDINAL_FLAG != 0 {
-                continue;
-            }
-            // `IMAGE_IMPORT_BY_NAME`: a u16 hint, then the name.
-            if self.c_string(entry + 2) == func {
-                // An import-address-table entry is pointer-aligned by the PE
-                // layout; the address stays inside the mapping (see `read`)
-                // and keeps the image's provenance.
-                let slot = addresses + j * size_of::<usize>();
-                return Some(ptr::with_exposed_provenance_mut(
-                    self.base.expose_provenance() + slot,
-                ));
-            }
-        }
-        None
-    }
-
-    const fn read<T: Copy>(&self, offset: usize) -> T {
-        // SAFETY: `base` is a mapped image (the type's invariant) and every
-        // offset read here comes from its own headers, which the loader
-        // validated when it mapped the image, so the sum stays inside it.
-        let at = unsafe { self.base.add(offset) };
-        // SAFETY: `at` is inside the mapping (above); `read_unaligned`
-        // tolerates the packed header layouts.
-        unsafe { at.cast::<T>().read_unaligned() }
-    }
-
-    /// The bytes of a NUL-terminated string at `offset`, without the terminator.
-    const fn c_string(&self, offset: usize) -> &[u8] {
-        let mut len = 0;
-        while self.read::<u8>(offset + len) != 0 {
-            len += 1;
-        }
-        // SAFETY: `offset` was just read from inside the mapping (see `read`).
-        let start = unsafe { self.base.add(offset) };
-        // SAFETY: the bytes `offset..offset + len` were just read one by one
-        // inside the mapping, so the slice lies within it and stays mapped
-        // for the image's lifetime, which outlives `self`.
-        unsafe { core::slice::from_raw_parts(start, len) }
+        // SAFETY: `base + rva` is `start`, the first byte of a range the system reported
+        // as committed memory of this process just above, so the offset stays inside one
+        // mapping.
+        let from = unsafe { self.base.add(rva) };
+        // SAFETY: `start..end` is committed, readable memory as of that query, and the
+        // loader lock `DllMain` runs under keeps the main module mapped; `out` is a distinct
+        // writable buffer of the same length, and bytes have no alignment.
+        unsafe { ptr::copy_nonoverlapping(from, out.as_mut_ptr(), out.len()) };
+        true
     }
 }
 
