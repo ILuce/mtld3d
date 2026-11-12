@@ -2816,6 +2816,140 @@ fn nowindowchanges_leaves_the_device_window_alone() {
     );
 }
 
+/// The name the workload child of the app-owned fullscreen test runs under.
+const APP_OWNED_FULLSCREEN_CHILD_NAME: &str = "app-owned-fullscreen.exe";
+
+/// A fullscreen device under `D3DCREATE_NOWINDOWCHANGES` still fills the display.
+///
+/// The application owns the window and sized it to the mode it asks for, as
+/// a game that passes the flag does. The mode-set is virtual, and win32u
+/// maps a window onto the physical display only when its position is
+/// applied, which under the flag the device never does: the window's style,
+/// rect and visibility stay the application's. So the device has win32u
+/// apply the position the window already has, the `NSWindow` follows the
+/// mode, and present scales the back buffer to the display as it does for a
+/// window the device manages. Without that the picture keeps the window's
+/// size in a part of the display, where native exclusive fullscreen covers
+/// it.
+///
+/// The child reads the presenter's drawable sizes back from its log: the
+/// window's own size while windowed, larger in both dimensions once
+/// fullscreen, and the window's own size again after the windowed `Reset`.
+#[test]
+fn nowindowchanges_fullscreen_fills_the_display() {
+    if running_as(APP_OWNED_FULLSCREEN_CHILD_NAME) {
+        app_owned_fullscreen_workload();
+        return;
+    }
+    run_in_private_log_child_with(
+        APP_OWNED_FULLSCREEN_CHILD_NAME,
+        "device::nowindowchanges_fullscreen_fills_the_display",
+        DRAWABLE_LOG_FILTER,
+        PRESENT_OCCLUDED,
+    );
+}
+
+/// The size the presenter last gave its drawable, as `(width, height)`, from the process log.
+fn last_drawable_size() -> Option<(u32, u32)> {
+    let lines = logged_lines("drawable resized");
+    let (_, size) = lines.last()?.rsplit_once("-> ")?;
+    let (width, height) = size.trim().split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?))
+}
+
+/// Present until the drawable's size satisfies `reached`, and hand the last size seen back.
+///
+/// Wine resizes the views a moment after the window's position is applied,
+/// so the size is polled for across a bounded number of presents, 20 ms
+/// apart; few enough that one [`DRAWABLE_TIMEOUT`] each still fits the
+/// runner's per-test bound.
+fn present_until_drawable(
+    h: &Harness,
+    color: u32,
+    reached: impl Fn((u32, u32)) -> bool,
+) -> Option<(u32, u32)> {
+    const PRESENTS: usize = 20;
+    let mut seen = last_drawable_size();
+    for _ in 0..PRESENTS {
+        h.render_once(color, |_| {});
+        seen = last_drawable_size();
+        if seen.is_some_and(&reached) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    seen
+}
+
+/// Go fullscreen and back on a window the application sized to the mode, reading the drawable.
+fn app_owned_fullscreen_workload() {
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    const GREEN: u32 = 0xFF00_FF00;
+
+    let (desktop_width, desktop_height) = Harness::current_display_mode();
+    if !display_lists_640x480() || desktop_width <= 640 || desktop_height <= 480 {
+        // No mode smaller than the desktop's to set: nothing to measure here.
+        return;
+    }
+    let h = Harness::create(&HarnessConfig {
+        behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_NOWINDOWCHANGES,
+        ..HarnessConfig::default()
+    });
+    // Held before the first read of the window's geometry, so no other
+    // test's mode-set falls between the reads this test compares.
+    h.hold_display_mode();
+    // The application's own placement: the mode's size, at the origin.
+    mtld3d_tests::set_window_pos(h.hwnd(), 0, 0, 640, 480);
+    let app_rect = h.window_rect();
+    let app_style = h.window_style();
+
+    h.render_once(RED, |_| {});
+    await_acquired_drawables(h.hwnd(), 1);
+    await_logged_lines("drawable resized", 1);
+    let windowed = last_drawable_size().expect("the attach sizes the drawable");
+
+    // Everything fullscreen is read first and judged after the windowed
+    // `Reset`: a failed assertion ends the process where it stands, and a
+    // process that ends holding a mode it set leaves the session's desktop
+    // in that mode for every test after it.
+    let mut pp = fullscreen_params(h.hwnd(), 640, 480);
+    let entered = h.reset_params(&mut pp);
+    let mode = Harness::current_display_mode();
+    let fullscreen = present_until_drawable(&h, BLUE, |size| size != windowed);
+    let fullscreen_rect = h.window_rect();
+    let fullscreen_style = h.window_style();
+    let left = h.reset(640, 480);
+    let restored = present_until_drawable(&h, GREEN, |size| size == windowed);
+
+    assert_eq!(entered, D3D_OK, "fullscreen Reset");
+    assert_eq!(left, D3D_OK, "windowed Reset");
+    assert_eq!(mode, (640, 480), "the fullscreen Reset set the mode");
+    assert!(
+        fullscreen.is_some_and(|(width, height)| width > windowed.0 && height > windowed.1),
+        "NOWINDOWCHANGES: the fullscreen picture covers the display, not the window's own \
+         {windowed:?}: {fullscreen:?}",
+    );
+    assert_eq!(
+        fullscreen_rect, app_rect,
+        "NOWINDOWCHANGES: filling the display must not move or size the device window",
+    );
+    assert_eq!(
+        fullscreen_style, app_style,
+        "NOWINDOWCHANGES: filling the display must not restyle or show the device window",
+    );
+    assert_eq!(
+        restored,
+        Some(windowed),
+        "NOWINDOWCHANGES: back in the desktop's mode the picture is the window's size again",
+    );
+    assert_eq!(
+        h.window_rect(),
+        app_rect,
+        "NOWINDOWCHANGES: leaving fullscreen must not move or size the device window",
+    );
+}
+
 #[test]
 fn reset_fullscreen_honors_a_settable_mode() {
     if !display_lists_640x480() {

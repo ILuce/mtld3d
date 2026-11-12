@@ -3159,6 +3159,25 @@ impl DeviceInner {
         mode: Option<mtld3d_core::display_mode::ModeRequest>,
     ) {
         self.fullscreen = Some(crate::fullscreen::enter(hwnd, self.manages_window(), mode));
+        self.follow_app_window();
+    }
+
+    /// Ask the next `Present` for the client surface after a mode change of the app's window.
+    ///
+    /// Under `D3DCREATE_NOWINDOWCHANGES`, `fullscreen` has win32u apply the
+    /// application's window position again after each mode change, so the
+    /// `NSWindow` follows the mode, and does it by a `SetWindowPos` that
+    /// sends the window no message. The subclass
+    /// asks for the client surface on a `WM_WINDOWPOSCHANGED` that can have
+    /// moved the client area, which is how a managed window's surface
+    /// follows its placement; this change sends none, so the device asks
+    /// here. Without it Wine's client view keeps its size inside the window
+    /// that grew, and the picture stays in a part of the display. A no-op
+    /// for a device that manages its window.
+    fn follow_app_window(&self) {
+        if !self.manages_window() {
+            self.cursor().request_client_surface();
+        }
     }
 
     /// `true` unless the app took window management over itself.
@@ -3176,6 +3195,7 @@ impl DeviceInner {
     pub fn update_fullscreen(&mut self, mode: Option<mtld3d_core::display_mode::ModeRequest>) {
         if let Some(saved) = self.fullscreen.as_mut() {
             crate::fullscreen::update(saved, mode);
+            self.follow_app_window();
         }
     }
 
@@ -3187,6 +3207,7 @@ impl DeviceInner {
     pub fn reactivate_fullscreen(&mut self) {
         if let Some(saved) = self.fullscreen.as_mut() {
             crate::fullscreen::reactivate(saved);
+            self.follow_app_window();
         }
     }
 
@@ -3206,6 +3227,7 @@ impl DeviceInner {
     pub fn leave_fullscreen(&mut self, reason: &mtld3d_core::fullscreen_log::LeaveReason) {
         if let Some(saved) = self.fullscreen.take() {
             crate::fullscreen::leave(&saved, self.leave_kind(), reason);
+            self.follow_app_window();
         }
     }
 
@@ -5749,6 +5771,8 @@ fn resolve_reset_window_mode(
         if accepted {
             dev.fullscreen = None;
         }
+        // Either way a mode change went by: out of fullscreen, or out and back.
+        dev.follow_app_window();
         return accepted;
     }
     apply_reset_window_mode(dev, pp);

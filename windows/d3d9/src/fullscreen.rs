@@ -61,6 +61,20 @@
 //! the app's back. The mode is still set and restored, and the focus window
 //! still activated, as native D3D9 does under the flag.
 //!
+//! One thing the app cannot do for its window is put it onto the display
+//! again after a mode change. win32u maps a window's rect onto the physical
+//! monitor when the window's position is applied, not when the mode changes,
+//! and a window this module manages gets that from the placement that
+//! follows each mode-set. A window left to the app would keep the physical
+//! rect the previous mode gave it: sized to a smaller mode it stays that many
+//! points in a part of the display, where native exclusive fullscreen, whose
+//! mode-set is physical, covers the display. So after every mode change of
+//! such a session the position the window already has is applied again, by
+//! a `SetWindowPos` the application cannot observe (see
+//! [`reapply_app_window`]); the flag's contract holds and the `NSWindow`
+//! follows the mode. A window the app did not size to its mode still shows
+//! the picture where that window is; the transition line names its rect.
+//!
 //! Only the primary display is driven, so a device whose window lives on a
 //! secondary monitor is covered by the wrong rect. Matching the window's
 //! current monitor is a follow-up.
@@ -75,7 +89,7 @@ use mtld3d_core::{
     fullscreen_resize::REASSERTS_LOGGED_AT_INFO,
     window_pos::{
         SWP_FRAMECHANGED, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-        SWP_SHOWWINDOW,
+        SWP_REAPPLY_ONLY, SWP_SHOWWINDOW,
     },
 };
 use rustc_hash::FxHashMap;
@@ -879,6 +893,37 @@ fn window_changes_suppressed(saved: &SavedWindow) -> bool {
     true
 }
 
+/// Have win32u map a window the app owns onto the display again; say where the app has it.
+///
+/// The window half of a transition under `D3DCREATE_NOWINDOWCHANGES`, run
+/// after the mode change it belongs to. Nothing the application can observe
+/// changes: [`SWP_REAPPLY_ONLY`] moves, sizes, restacks and activates
+/// nothing, recomputes no frame and announces nothing, so the window's
+/// procedure hears of no position change, as on native D3D9, which makes
+/// none under the flag. What the call does is the part of `SetWindowPos`
+/// that is not about the window at all: win32u hands the driver the rect
+/// the window has, mapped for the mode in place now, and the `NSWindow`
+/// follows it. That is what a managed window gets from
+/// [`apply_fullscreen_window`] and its restore; without it a window sized
+/// to the device's mode keeps its pre-mode physical rect and the picture
+/// stays in a part of the display.
+///
+/// A window that is gone, or a call user32 refuses, leaves things as they
+/// were, which is the behaviour before this existed.
+fn reapply_app_window(hwnd: *mut c_void) -> WindowPlacement {
+    if !is_window(hwnd) {
+        return WindowPlacement::AppOwned(None);
+    }
+    if !set_window_pos(hwnd, core::ptr::null_mut(), Rect::EMPTY, SWP_REAPPLY_ONLY) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "D3DCREATE_NOWINDOWCHANGES: applying the device window's own position again \
+             failed; the window keeps the physical rect it had before the display mode changed",
+        );
+    }
+    WindowPlacement::AppOwned(window_rect(hwnd).map(|rect| rect.label()))
+}
+
 /// `SetWindowPos`'s `HWND_TOP`: the top of the windows that are not topmost.
 const HWND_TOP: *mut c_void = core::ptr::null_mut();
 
@@ -924,7 +969,8 @@ pub fn activate_focus_window(focus: *mut c_void) {
 /// comes after. The z-order is deliberately untouched; see the module docs.
 /// With `manage_window` false (`D3DCREATE_NOWINDOWCHANGES`) the window half
 /// is skipped: the state is captured, the window is left to the app, and
-/// every later window transition is a no-op. The mode is set either way.
+/// every later window transition only has win32u apply the position the
+/// window already has ([`reapply_app_window`]). The mode is set either way.
 pub fn enter(hwnd: *mut c_void, manage_window: bool, mode: Option<ModeRequest>) -> SavedWindow {
     // Held across the mode-set too: win32u broadcasts `WM_DISPLAYCHANGE`
     // synchronously from inside it, and a game handler that answers by
@@ -943,7 +989,7 @@ pub fn enter(hwnd: *mut c_void, manage_window: bool, mode: Option<ModeRequest>) 
     let outcome = set_requested_mode(mode);
     saved.mode = outcome.mode_in_place();
     let placement = if window_changes_suppressed(&saved) {
-        WindowPlacement::AppOwned
+        reapply_app_window(hwnd)
     } else {
         apply_fullscreen_window(hwnd, &saved)
     };
@@ -967,7 +1013,7 @@ pub fn update(saved: &mut SavedWindow, mode: Option<ModeRequest>) {
     let outcome = set_requested_mode(mode);
     saved.mode = outcome.mode_in_place();
     let placement = if window_changes_suppressed(saved) {
-        WindowPlacement::AppOwned
+        reapply_app_window(saved.hwnd)
     } else {
         saved.guard.reset();
         apply_fullscreen_window(saved.hwnd, saved)
@@ -990,7 +1036,7 @@ pub fn reactivate(saved: &mut SavedWindow) {
     let _driving = DrivingGuard::new(saved.hwnd);
     let outcome = set_requested_mode(saved.mode);
     let placement = if window_changes_suppressed(saved) {
-        WindowPlacement::AppOwned
+        reapply_app_window(saved.hwnd)
     } else {
         saved.guard.reset();
         apply_fullscreen_window(saved.hwnd, saved)
@@ -1192,11 +1238,11 @@ pub fn try_leave(saved: &SavedWindow, kind: LeaveKind, accept: impl FnOnce() -> 
     }
     let result = change_display_settings(Some(&mut mode), CDS_FULLSCREEN);
     // A window with no snapshot was the app's or was already destroyed, and
-    // is left as it is.
+    // is left as it is; the app's is mapped for the mode just put back.
     let untouched = if saved.manage_window {
         WindowPlacement::Gone
     } else {
-        WindowPlacement::AppOwned
+        reapply_app_window(saved.hwnd)
     };
     let placement = rect.map_or(untouched, |rect| {
         set_window_long(saved.hwnd, GWL_STYLE, style);
@@ -1292,7 +1338,8 @@ enum KeptRect {
 /// the window during the restore or the rect could not be read.
 fn restore_window(saved: &SavedWindow, kind: LeaveKind, kept: &KeptRect) -> WindowPlacement {
     if window_changes_suppressed(saved) {
-        return WindowPlacement::AppOwned;
+        // The registry mode is back by now; the app's window follows it.
+        return reapply_app_window(saved.hwnd);
     }
     let _driving = DrivingGuard::new(saved.hwnd);
     let hwnd = saved.hwnd;

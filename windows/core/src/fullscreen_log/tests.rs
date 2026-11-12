@@ -42,8 +42,12 @@ fn every_window_placement_says_where_the_window_went() {
         "window not moved, the monitor rect is unreadable"
     );
     assert_eq!(
-        WindowPlacement::AppOwned.to_string(),
+        WindowPlacement::AppOwned(None).to_string(),
         "window left to the app (D3DCREATE_NOWINDOWCHANGES)"
+    );
+    assert_eq!(
+        WindowPlacement::AppOwned(Some(RectLabel::new(0, 0, 1024, 768))).to_string(),
+        "window left to the app (D3DCREATE_NOWINDOWCHANGES): 1024x768 at (0, 0)"
     );
     assert_eq!(
         WindowPlacement::Gone.to_string(),
