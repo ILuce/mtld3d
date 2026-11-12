@@ -663,8 +663,10 @@ const fn context_register(context: *mut c_void, offset: usize) -> Option<usize> 
     Some(usize::from_ne_bytes(unsafe { register.read() }))
 }
 
-/// The bounds of the region of the address space that holds `addr`, when the system
-/// describes it as memory a read does not fault on.
+/// The bounds of the region that holds `addr`, when a read of it does not fault.
+///
+/// The region is the one the system describes for that address, and only memory it
+/// reports as committed and readable counts.
 ///
 /// Fork patch 1: `import_patch` reads the process's main module only where this says
 /// it can, because a packed executable's headers and tables do not have to describe what

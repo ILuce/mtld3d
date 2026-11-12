@@ -50,8 +50,9 @@ pub struct Hook<'a> {
 /// 1: a packed main module's headers and tables do not have to describe what is mapped).
 pub struct MappedImage {
     base: *const u8,
-    /// The address range the system last reported as committed and readable, so the reads
-    /// of one table ask once.
+    /// The address range the system last reported as committed and readable.
+    ///
+    /// Kept so that the reads of one table ask once.
     readable: Cell<(usize, usize)>,
 }
 
