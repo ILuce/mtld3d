@@ -13,7 +13,7 @@ supports it. It is built only for Apple Silicon macOS.
   that a real program showed, each with a test.
 - A release of the fork is a tag `v<upstream version>+iluce.<N>` on that branch; both
   workspaces carry the same version, and the libraries log it
-  (`d3d9.dll v0.15.3+iluce.1 ... loaded`).
+  (`d3d9.dll v0.15.3+iluce.2 ... loaded`).
 - When upstream publishes a release, the patches are carried onto it; a patch upstream made
   unnecessary is dropped.
 
@@ -22,6 +22,7 @@ supports it. It is built only for Apple Silicon macOS.
 | Fork release | Upstream base | Patches |
 |---|---|---|
 | `v0.15.3+iluce.1` | `v0.15.3` (`aedfa404910522d2cd9459c283f52de54a3f7599`) | 1 |
+| `v0.15.3+iluce.2` | `v0.15.3` (`aedfa404910522d2cd9459c283f52de54a3f7599`) | 1, 2 |
 
 A release carries the five files an arm64 Wine of the wine-build family loads from its
 `lib/wine/d3d9/mtld3d` tree: `i386-windows/d3d9.dll` and `mtld3d.dll`,
@@ -64,3 +65,41 @@ L"d3d9.dll" failed`.
 the tests: an ordinary bound image in both formats, the packed shape, and tables that leave
 the image, never end or cannot be read. On upstream's walk the packed shape reads outside the
 image; with the patch nothing outside it is read.
+
+### 2. A fullscreen device that leaves its window to the application fills the display
+
+**The gap.** A device created with `D3DCREATE_NOWINDOWCHANGES` sets the display mode and leaves
+the window's style, rect and visibility to the application. Under Wine the mode-set is virtual
+(`EmulateModeset`): win32u maps a window onto the physical monitor when the window's position
+is applied, and Wine sizes the client view the frames are shown in when the client surface is
+presented again. A window the device manages gets both from the placement that follows each
+mode-set. A window left to the application got neither, so a window sized to a mode smaller
+than the desktop's kept its physical size and the picture stood unscaled in a part of the
+display. On Windows the mode-set is physical and exclusive fullscreen covers the display,
+whatever the window is.
+
+**The program.** Just Cause 1 (2006), the Steam release: a 1024x768 fullscreen device with the
+flag was shown 1:1 in a part of a 1710x1112 display (`present: guest 1024x768, layer
+1024x768pt`).
+
+**The change.**
+
+- After every mode change of such a session (entering fullscreen, a `Reset` that keeps it,
+  re-activation, leaving, a rejected windowed `Reset`) the device has win32u apply the position
+  the window already has: one `SetWindowPos` with `SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER |
+  SWP_NOACTIVATE | SWP_NOSENDCHANGING` (`windows/d3d9/src/fullscreen.rs`,
+  `reapply_app_window`). Nothing moves and the window's procedure receives no message, as on
+  native D3D9, which makes no position change under the flag.
+- The device then asks its next `Present` to show the client surface again
+  (`windows/d3d9/src/device.rs`, `follow_app_window`), as the window subclass does after a
+  managed window's position change.
+- The transition line names where the application has its window: `window left to the app
+  (D3DCREATE_NOWINDOWCHANGES): 1024x768 at (0, 0)`.
+- Not covered: a window the application did not size to its mode shows the picture where that
+  window is mapped, and a second device on the same window is not asked for its client surface.
+
+**The tests.** `device::nowindowchanges_fullscreen_fills_the_display` in the end-to-end suite:
+on a window the test sized to the mode, the presenter's drawable grows from the window's size
+once the device is fullscreen and returns to it after the windowed `Reset`, while the window's
+rect and style stay as the application left them. Without the patch the drawable keeps the
+window's size. Unit tests of the flag set and of the transition line in `mtld3d-core`.
