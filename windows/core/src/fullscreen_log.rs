@@ -77,7 +77,12 @@ pub enum WindowPlacement {
     /// The monitor rect could not be read, so the window was not moved.
     NoMonitor,
     /// `D3DCREATE_NOWINDOWCHANGES`: the window is the app's and was not touched.
-    AppOwned,
+    ///
+    /// The rect is where the application has it, when it could be read. A
+    /// fullscreen device presents into that window as it is, so a window
+    /// that does not cover the mode shows the picture in a part of the
+    /// display, and the line is what says whose window that is and where.
+    AppOwned(Option<RectLabel>),
     /// The window no longer exists.
     Gone,
     /// The pre-fullscreen rect was never read, so the window stayed where it is.
@@ -103,7 +108,10 @@ impl fmt::Display for WindowPlacement {
         match self {
             Self::Placed(rect) => write!(f, "window {rect}"),
             Self::NoMonitor => f.write_str("window not moved, the monitor rect is unreadable"),
-            Self::AppOwned => f.write_str("window left to the app (D3DCREATE_NOWINDOWCHANGES)"),
+            Self::AppOwned(rect) => {
+                f.write_str("window left to the app (D3DCREATE_NOWINDOWCHANGES)")?;
+                rect.as_ref().map_or(Ok(()), |rect| write!(f, ": {rect}"))
+            }
             Self::Gone => f.write_str("window already destroyed"),
             Self::Unmoved => f.write_str("window not moved, its windowed rect was never read"),
             Self::KeptFullscreen { shown, put_back } => {
